@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'api-gateway'
+    static_configs:
+      - targets: ['api-gateway:8000']
+
+  - job_name: 'stock-service'
+    static_configs:
+      - targets: ['stock-service:8001']
+
+  - job_name: 'crypto-service'
+    static_configs:
+      - targets: ['crypto-service:8002']
+
+  - job_name: 'mlops-service'
+    static_configs:
+      - targets: ['mlops-service:8003']
+
+rule_files:
+  - 'alerts.yml'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']

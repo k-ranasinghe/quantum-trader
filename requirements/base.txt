@@ -1,0 +1,55 @@
+# Core
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+sqlalchemy
+alembic
+asyncpg
+psycopg2-binary
+redis
+celery
+rabbitmq
+
+# ML & Data
+numpy
+pandas
+polars
+torch
+stable-baselines3
+finrl
+gymnasium
+
+# Deep Learning
+transformers
+timm
+
+# Technical Analysis
+ta
+ta-lib
+
+# MLOps
+mlflow
+optuna
+evidently
+# whylogs
+
+# Data Sources
+yfinance
+ccxt
+alpaca-trade-api
+polygon-api-client
+
+# Monitoring
+prometheus-client
+opentelemetry-api
+opentelemetry-sdk
+
+# Utils
+python-dotenv
+httpx
+websockets
+aiohttp
+tenacity
+python-jose[cryptography]
+passlib[bcrypt]

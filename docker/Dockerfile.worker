@@ -1,0 +1,8 @@
+FROM: quantum-trading/base:latest
+
+WORKDIR: /app
+
+# Install additional ML dependencies
+RUN: pip install torch torchvision stable-baselines3 finrl
+
+CMD: ["celery", "-A", "workers.training_worker", "worker", "--loglevel=info", "--concurrency=4"]
