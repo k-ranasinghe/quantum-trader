@@ -123,7 +123,7 @@ graph TD
     source .venv/bin/activate
     
     # On Windows
-    source .venv\Scripts\activate
+    .venv\Scripts\activate
     ```
 
 2.  **Install dependencies:**
