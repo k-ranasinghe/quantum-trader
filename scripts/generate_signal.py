@@ -3,6 +3,7 @@ import sys
 sys.path.append('..')
 
 from config.constants import CONSTANTS
+from config.settings import settings
 from services.inference_service import InferenceService
 
 
@@ -21,16 +22,15 @@ def main():
 
     # Initialize runtime
     runtime = InferenceService(
-        model_paths=model_paths,
-        asset=CONSTANTS.ASSET,
-        timeframe=CONSTANTS.TIMEFRAME,
+        asset_symbol=CONSTANTS.ASSET,
+        model_registry_path=settings.MODEL_REGISTRY_DIR
     )
 
-    # Generate and display signal
-    signal = runtime.generate_and_display_signal()
+    # Generate signal
+    signal = runtime.generate_signal()
 
-    # Save signal
-    runtime.save_signal(signal, CONSTANTS.SAVE_PATH)
+    # Displaysignal
+    print(signal)
 
 
 if __name__ == "__main__":

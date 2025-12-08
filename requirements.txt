@@ -15,7 +15,8 @@ rabbitmq
 numpy
 pandas
 polars
-torch
+xgboost
+torch==2.9.1
 stable-baselines3
 finrl
 gymnasium
@@ -32,7 +33,6 @@ ta-lib
 mlflow
 optuna
 evidently
-# whylogs
 
 # Data Sources
 yfinance
@@ -53,3 +53,4 @@ aiohttp
 tenacity
 python-jose[cryptography]
 passlib[bcrypt]
+pytest

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, Dict
 
-from v3.config.constants import CONSTANTS
+from config.constants import CONSTANTS
 
 
 class TripleBarrierLabeler:

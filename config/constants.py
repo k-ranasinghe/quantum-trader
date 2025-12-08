@@ -1,6 +1,9 @@
 import torch
 from datetime import timedelta
 
+from config.settings import settings
+
+
 class CONSTANTS:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     ASSET = "AAPL"
@@ -34,4 +37,4 @@ class CONSTANTS:
         "3mo":  timedelta(days=365*10),
     }
 
-    SAVE_PATH = "../results/registry"
+    SAVE_PATH = settings.MODEL_REGISTRY_DIR

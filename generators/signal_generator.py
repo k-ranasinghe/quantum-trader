@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from models.cnn import MultiHeadCNNAttention
 from models.lstm import BiLSTMWithHybridLoss
+from utilities.logger import logger
 
 
 class SignalGenerator(nn.Module):
@@ -124,23 +125,28 @@ class SignalGenerator(nn.Module):
 
     def load(self, checkpoint_path, device="cpu"):
         """Smart loader that auto-adjusts model architecture to the checkpoint"""
-        state = torch.load(checkpoint_path, map_location=device)
+        try:
+            state = torch.load(checkpoint_path, map_location=device)
 
-        # Detect d_model from checkpoint shapes
-        # fusion.weight shape = [d_model, 192]
-        fusion_weight_shape = state["feature_extractor.fusion.weight"].shape
-        old_d_model = fusion_weight_shape[0]
+            # Detect d_model from checkpoint shapes
+            # fusion.weight shape = [d_model, 192]
+            if "feature_extractor.fusion.weight" in state:
+                fusion_weight_shape = state["feature_extractor.fusion.weight"].shape
+                old_d_model = fusion_weight_shape[0]
 
-        if old_d_model != self.feature_extractor.fusion.out_features:
-            print(
-                f"[INFO] Adjusting model: checkpoint d_model={old_d_model}, current={self.feature_extractor.fusion.out_features}")
+                if old_d_model != self.feature_extractor.fusion.out_features:
+                    logger.info(
+                        f"Adjusting model: checkpoint d_model={old_d_model}, current={self.feature_extractor.fusion.out_features}")
 
-            # Rebuild model with correct d_model
-            self.__init__(input_dim=15, seq_len=self.seq_len, d_model=old_d_model)
+                    # Rebuild model with correct d_model
+                    self.__init__(input_dim=15, seq_len=self.seq_len, d_model=old_d_model)
 
-        # Now load weights
-        self.load_state_dict(state)
-        self.to(device)
-        self.eval()
+            # Now load weights
+            self.load_state_dict(state)
+            self.to(device)
+            self.eval()
 
-        print(f"[OK] Loaded model with d_model={old_d_model}")
+            logger.info(f"Successfully loaded model from {checkpoint_path}")
+        except Exception as e:
+            logger.error(f"Failed to load model from {checkpoint_path}: {e}")
+            raise e

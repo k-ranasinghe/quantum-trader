@@ -1,247 +1,118 @@
-version: '3.8'
-
 services:
-  postgres:
+# ===================================
+# FastAPI Application
+# ===================================
+  api:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/quantum_trader
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ./results:/app/results # Shared volume for artifacts
+    depends_on:
+      - db
+      - redis
+      - rabbitmq
+      - mlflow
+
+# ===================================
+# Celery Worker
+# ===================================
+  worker:
+    build: .
+    command: celery -A config.celery_app worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/quantum_trader
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ./results:/app/results # Shared volume for artifacts
+    depends_on:
+      - db
+      - redis
+      - rabbitmq
+      - mlflow
+
+# ===================================
+# Celery Beat (Scheduler)
+# ===================================
+  beat:
+    build: .
+    command: celery -A config.celery_app beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/quantum_trader
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
+    depends_on:
+      - db
+      - redis
+      - rabbitmq
+
+# ===================================
+# PostgreSQL
+# ===================================
+  db:
     image: postgres:15-alpine
     environment:
-      POSTGRES_DB: quantum_trading
-      POSTGRES_USER: quantum
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=quantum_trader
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U quantum" ]
+      test: [ "CMD-SHELL", "pg_isready -U user -d quantum_trader" ]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
-  influxdb:
-    image: influxdb:2.7-alpine
-    container_name: quantum-influxdb
-    environment:
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: quantum
-      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_PASSWORD}
-      DOCKER_INFLUXDB_INIT_ORG: quantum-trading
-      DOCKER_INFLUXDB_INIT_BUCKET: market-data
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN}
-    ports:
-      - "8086:8086"
-    volumes:
-      - influxdb_data:/var/lib/influxdb2
-
+# ===================================
+# Redis
+# ===================================
   redis:
     image: redis:7-alpine
-    container_name: quantum-redis
     ports:
       - "6379:6379"
-    command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
+    restart: unless-stopped
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
-      timeout: 5s
+      timeout: 3s
       retries: 5
+      start_period: 5s
 
+# ===================================
+# RabbitMQ
+# ===================================
   rabbitmq:
     image: rabbitmq:3-management-alpine
-    container_name: quantum-rabbitmq
     ports:
       - "5672:5672"
       - "15672:15672"
-    environment:
-      RABBITMQ_DEFAULT_USER: quantum
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: rabbitmq-diagnostics -q ping
-      interval: 30s
-      timeout: 10s
-      retries: 5
 
+# ===================================
+# MLflow Tracking Server
+# ===================================
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.9.2
-    container_name: quantum-mlflow
+    image: ghcr.io/mlflow/mlflow:v3.6.0
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow-artifacts --allowed-hosts "*"
     ports:
       - "5000:5000"
-    environment:
-      MLFLOW_BACKEND_STORE_URI: postgresql://quantum:${POSTGRES_PASSWORD}@postgres:5432/mlflow
-      MLFLOW_DEFAULT_ARTIFACT_ROOT: ./mlruns
     volumes:
-      - mlflow_data:/mlflow
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --port 5000
-      --backend-store-uri postgresql://quantum:${POSTGRES_PASSWORD}@postgres:5432/mlflow
-      --default-artifact-root ./mlruns
-    depends_on:
-      - postgres
-
-  api_gateway:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api_gateway
-    ports:
-      - "8000:8000"
-    environment:
-      - ENVIRONMENT=development
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - REDIS_HOST=redis
-      - RABBITMQ_HOST=rabbitmq
-      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD}
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
-    restart: unless-stopped
-
-  stock_service:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.stock_service
-    container_name: quantum-stock-service
-    ports:
-      - "8001:8001"
-    environment:
-      - ENVIRONMENT=development
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - REDIS_HOST=redis
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-    depends_on:
-      - postgres
-      - redis
-      - mlflow
-    volumes:
-      - ./services/stock_service:/app/services/stock_service
-      - ./shared:/app/shared
-      - model_cache:/app/model_cache
-    restart: unless-stopped
-
-  crypto_service:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.crypto_service
-    container_name: quantum-crypto-service
-    ports:
-      - "8002:8002"
-    environment:
-      - ENVIRONMENT=development
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - REDIS_HOST=redis
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-    depends_on:
-      - postgres
-      - redis
-      - mlflow
-    volumes:
-      - ./services/crypto_service:/app/services/crypto_service
-      - ./shared:/app/shared
-      - model_cache:/app/model_cache
-    restart: unless-stopped
-
-  mlops_service:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.mlops_service
-    container_name: quantum-mlops-service
-    ports:
-      - "8003:8003"
-    environment:
-      - ENVIRONMENT=development
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-    depends_on:
-      - postgres
-      - mlflow
-    volumes:
-      - ./services/mlops_service:/app/services/mlops_service
-      - ./shared:/app/shared
-    restart: unless-stopped
-
-  training_worker:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker
-    container_name: quantum-training-worker
-    environment:
-      - ENVIRONMENT=development
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - REDIS_HOST=redis
-      - RABBITMQ_HOST=rabbitmq
-      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD}
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./workers:/app/workers
-      - ./shared:/app/shared
-      - model_cache:/app/model_cache
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: '4'
-          memory: 8G
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: quantum-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-    restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: quantum-grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
-      - GF_INSTALL_PLUGINS=grafana-clock-panel
-    volumes:
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
-      - grafana_data:/var/lib/grafana
-    depends_on:
-      - prometheus
-    restart: unless-stopped
+      - mlflow_data:/mlflow-artifacts
 
 volumes:
   postgres_data:
-  influxdb_data:
   redis_data:
-  rabbitmq_data:
   mlflow_data:
-  prometheus_data:
-  grafana_data:
-  model_cache:
-
-networks:
-  default:
-    name: quantum-network

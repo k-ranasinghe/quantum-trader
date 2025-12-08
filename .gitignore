@@ -145,5 +145,5 @@ mlruns/
 checkpoints/
 *_data/
 
-# Scripts
-/scripts/*
+# Model results
+results/

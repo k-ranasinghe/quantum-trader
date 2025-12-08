@@ -1,16 +1,30 @@
-# This is a sample Python script.
+from fastapi import FastAPI
+from api.routes import router
+from database.db import engine, Base
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+from config.settings import settings
 
+app = FastAPI(title="QuantTrader API", version="1.0.0")
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+# Create tables ONLY if not testing (tests create their own in-memory DB)
+# OR if strictly running the app.
+# The error happens because 'main.py' is imported, which runs 'Base.metadata.create_all(bind=engine)'
+# 'engine' is configured to connect to Postgres from settings.DATABASE_URL
+# In test environment, this fails.
 
+# We should move the table creation to a startup event or conditional check.
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
+@app.on_event("startup")
+def startup():
+    # Only try to create tables if we can connect, or let Alembic handle it in prod.
+    # For simplicity here:
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        print(f"Warning: Could not create tables on startup (normal during tests if DB not up): {e}")
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+app.include_router(router)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

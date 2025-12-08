@@ -1,3 +1,5 @@
+import os
+import shutil
 import numpy as np
 import pandas as pd
 import torch
@@ -7,135 +9,75 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.preprocessing import StandardScaler
 from sklearn.dummy import DummyClassifier
 import xgboost as xgb
-import yfinance as yf
+import mlflow
+import mlflow.pytorch
+import mlflow.xgboost
 import warnings
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
-from typing import Dict,Tuple, Optional
+import pickle
+from typing import Dict, Tuple, Optional
 
 from config.constants import CONSTANTS
+from config.settings import settings
+from controllers.ensemble import SignalEnsemble
 from environments.signal_env import SignalEnv
 from generators.rl_signal_generator import RLSignalGenerator
+from generators.signal_generator import SignalGenerator
 from labellers.triple_barrier import TripleBarrierLabeler
 from models.loss_function import TradingLoss
-from controllers.ensemble import SignalEnsemble
+from services.feature_store import FeatureStore
+from utilities.logger import logger
 
 warnings.filterwarnings("ignore")
 
 
 class TrainService:
     """
-    End-to-end training service for the trading signal generation system.
+    End-to-end training service with MLFlow integration.
     """
 
     def __init__(
-        self,
-        asset: str = CONSTANTS.ASSET,
-        timeframe: str = CONSTANTS.TIMEFRAME,
-        period: str = CONSTANTS.PERIOD,
-        seq_len: int = CONSTANTS.SEQ_LEN,
-        device: str = CONSTANTS.DEVICE
+            self,
+            asset: str = CONSTANTS.ASSET,
+            model_registry_path: str = settings.MODEL_REGISTRY_DIR,
+            timeframe: str = CONSTANTS.TIMEFRAME,
+            period: str = CONSTANTS.PERIOD,
+            seq_len: int = CONSTANTS.SEQ_LEN,
+            device: str = CONSTANTS.DEVICE
     ):
         self.asset = asset
         self.timeframe = timeframe
         self.period = period
         self.seq_len = seq_len
         self.device = device
+        self.registry_path = model_registry_path
+        self.feature_store = FeatureStore()
 
         self.df: Optional[pd.DataFrame] = None
         self.scaler: Optional[StandardScaler] = None
         self.labeler: Optional[TripleBarrierLabeler] = None
+
+        # Models
         self.models: Dict[str, torch.nn.Module] = {}
         self.rl_agent: Optional[RLSignalGenerator] = None
         self.regime_detector: Optional[xgb.XGBClassifier] = None
         self.meta_model: Optional[xgb.XGBClassifier] = None
         self.ensemble: Optional[SignalEnsemble] = None
 
-        print("Training Service initialized.")
-
-    def download_yfinance(self, ticker: str) -> pd.DataFrame:
-        """Robust yfinance downloader with chunking for large periods"""
-        end_date = datetime.now()
-        period_lower = self.period.lower()
-
-        if period_lower == "max":
-            start_date = datetime(1970, 1, 1)
-        elif period_lower == "ytd":
-            start_date = datetime(end_date.year, 1, 1)
-        elif period_lower.endswith("d"):
-            start_date = end_date - timedelta(days=int(period_lower[:-1]))
-        elif period_lower.endswith("mo"):
-            start_date = end_date - relativedelta(months=int(period_lower[:-2]))
-        elif period_lower.endswith("y"):
-            start_date = end_date - relativedelta(years=int(period_lower[:-1]))
-        else:
-            start_date = end_date - timedelta(days=int(period_lower or 730))
-
-        max_delta = CONSTANTS.INTERVAL_MAX_PERIOD.get(self.timeframe, timedelta(days=730))
-        print(f"Downloading {ticker} | {self.timeframe} | from {start_date.date()} to {end_date.date()}")
-
-        dfs = []
-        current_start = start_date
-
-        while current_start < end_date:
-            current_end = min(current_start + max_delta, end_date)
-            chunk = yf.download(
-                tickers=ticker,
-                start=current_start.strftime("%Y-%m-%d"),
-                end=current_end.strftime("%Y-%m-%d"),
-                interval=self.timeframe,
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-                repair=True
-            )
-            if not chunk.empty:
-                dfs.append(chunk)
-                print(f"  Fetched {len(chunk)} rows → {current_start.date()} to {current_end.date()}")
-            current_start = current_end + timedelta(seconds=1)
-
-        if not dfs:
-            raise ValueError("No data downloaded")
-
-        df = pd.concat(dfs)
-        df = df[~df.index.duplicated(keep="first")].sort_index()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
+        logger.info(f"Training Service initialized for {asset}")
+        mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(f"quant_trader_{asset}")
 
     def load_and_prepare_data(self) -> pd.DataFrame:
-        """Download and engineer features"""
-        print(f"\nLoading data for {self.asset}...")
-        self.df = self.download_yfinance(self.asset)
-
-        print(f"Raw data: {len(self.df)} rows")
-
-        # Feature engineering (same as inference)
-        self.df['returns'] = self.df['Close'].pct_change()
-        self.df['volatility'] = self.df['returns'].rolling(20).std()
-
-        delta = self.df['Close'].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / (loss + 1e-8)
-        self.df['rsi'] = 100 - (100 / (1 + rs))
-
-        self.df['ma20'] = self.df['Close'].rolling(20).mean()
-        self.df['ma60'] = self.df['Close'].rolling(60).mean()
-        self.df['price_ratio'] = self.df['Close'] / (self.df['ma20'] + 1e-8)
-        self.df['vol_spike'] = (self.df['volatility'] / (self.df['volatility'].rolling(50).mean() + 1e-8)) - 1
-
-        self.df['bb_upper'] = self.df['ma20'] + 2 * self.df['volatility']
-        self.df['bb_lower'] = self.df['ma20'] - 2 * self.df['volatility']
-        self.df['bb_position'] = (self.df['Close'] - self.df['bb_lower']) / (self.df['bb_upper'] - self.df['bb_lower'] + 1e-8)
-
-        self.df.dropna(inplace=True)
-        print(f"Final data shape: {self.df.shape}")
+        """Fetch data from Feature Store"""
+        logger.info(f"Loading data for {self.asset}...")
+        self.df = self.feature_store.get_training_features(self.asset, self.period)
+        logger.info(f"Final data shape: {self.df.shape}")
         return self.df
 
     def create_labeled_dataset(self) -> Tuple[np.ndarray, dict, StandardScaler]:
         """Generate features, labels, and fit scaler"""
-        print("\nCreating labeled dataset...")
+        logger.info("Creating labeled dataset...")
+
         self.labeler = TripleBarrierLabeler(
             atr_period=14,
             entry_spread_multiplier=0.5,
@@ -154,11 +96,11 @@ class TrainService:
             self.df, sequence_length=self.seq_len, asset_name=self.asset
         )
 
-        print(f"Labeled samples: {len(X)}")
-        print(f"Action distribution: {torch.bincount(y['action'])}")
+        logger.info(f"Labeled samples: {len(X)}")
         return X, y, self.scaler
 
     def train_model(self, model, X_train, y_train, X_val, y_val, name):
+        """Train PyTorch model and log to MLFlow"""
         criterion = TradingLoss()
         optimizer = optim.AdamW(model.parameters(), lr=CONSTANTS.LEARNING_RATE, weight_decay=1e-4)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
@@ -180,30 +122,54 @@ class TrainService:
         best_loss = float('inf')
         patience = 0
 
-        print(f"\nTraining {name}...")
-        for epoch in range(CONSTANTS.EPOCHS):
-            model.train()
-            train_loss = self._train_epoch(model, train_loader, optimizer, criterion)
-            model.eval()
-            val_loss = self._validate_epoch(model, val_loader, criterion)
+        model.to(self.device)
 
-            scheduler.step(val_loss)
+        logger.info(f"Training {name}...")
 
-            if val_loss < best_loss:
-                best_loss = val_loss
-                patience = 0
-                torch.save(model.state_dict(), f"{CONSTANTS.SAVE_PATH}/best_{name}.pth")
-            else:
-                patience += 1
+        # Determine save filename
+        # We need this file to persist for the Celery task to copy it later
+        save_path = f"{self.registry_path}/best_{name}.pth"
 
-            if epoch % 10 == 0 or epoch == CONSTANTS.EPOCHS - 1:
-                print(f"  Epoch {epoch+1} | Train: {train_loss:.4f} | Val: {val_loss:.4f}")
+        with mlflow.start_run(run_name=f"train_{name}", nested=True):
+            mlflow.log_param("model_name", name)
+            mlflow.log_param("batch_size", CONSTANTS.BATCH_SIZE)
+            mlflow.log_param("learning_rate", CONSTANTS.LEARNING_RATE)
 
-            if patience >= CONSTANTS.PATIENCE:
-                print(f"  Early stopping at epoch {epoch+1}")
-                break
+            for epoch in range(CONSTANTS.EPOCHS):
+                model.train()
+                train_loss = self._train_epoch(model, train_loader, optimizer, criterion)
 
-        model.load_state_dict(torch.load(f"{CONSTANTS.SAVE_PATH}/best_{name}.pth"))
+                model.eval()
+                val_loss = self._validate_epoch(model, val_loader, criterion)
+
+                scheduler.step(val_loss)
+
+                mlflow.log_metric("train_loss", train_loss, step=epoch)
+                mlflow.log_metric("val_loss", val_loss, step=epoch)
+
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience = 0
+                    # Save best model locally
+                    torch.save(model.state_dict(), save_path)
+                else:
+                    patience += 1
+
+                if epoch % 10 == 0:
+                    logger.info(f"  Epoch {epoch + 1} | Train: {train_loss:.4f} | Val: {val_loss:.4f}")
+
+                if patience >= CONSTANTS.PATIENCE:
+                    logger.info(f"  Early stopping at epoch {epoch + 1}")
+                    break
+
+            # Load best weights to return
+            model.load_state_dict(torch.load(save_path))
+            # We do NOT remove save_path here, so the task can pick it up.
+
+            # Log model to MLFlow
+            mlflow.pytorch.log_model(model, name)
+            mlflow.log_metric("best_val_loss", best_loss)
+
         return model, {"best_val_loss": best_loss}
 
     def _train_epoch(self, model, loader, optimizer, criterion):
@@ -211,7 +177,8 @@ class TrainService:
         for batch in loader:
             x = batch[0].to(self.device)
             targets = {k: v.to(self.device) for k, v in zip(
-                ['action', 'entry_range', 'stop_loss', 'take_profits', 'leverage', 'hold_time', 'confidence', 'volatility'],
+                ['action', 'entry_range', 'stop_loss', 'take_profits', 'leverage', 'hold_time', 'confidence',
+                 'volatility'],
                 batch[1:]
             )}
             optimizer.zero_grad()
@@ -225,12 +192,12 @@ class TrainService:
 
     def _validate_epoch(self, model, loader, criterion):
         losses = []
-        model.eval()
         with torch.no_grad():
             for batch in loader:
                 x = batch[0].to(self.device)
                 targets = {k: v.to(self.device) for k, v in zip(
-                    ['action', 'entry_range', 'stop_loss', 'take_profits', 'leverage', 'hold_time', 'confidence', 'volatility'],
+                    ['action', 'entry_range', 'stop_loss', 'take_profits', 'leverage', 'hold_time', 'confidence',
+                     'volatility'],
                     batch[1:]
                 )}
                 pred = model(x)
@@ -240,14 +207,14 @@ class TrainService:
 
     def train_regime_detector(self):
         """Train market regime detector"""
-        print("\nTraining regime detector...")
+        logger.info("Training regime detector...")
 
+        # Prepare data (same logic as before)
         features = []
         labels = []
 
         for i in range(100, len(self.df) - 20):
             window = self.df.iloc[i - 100:i]
-
             feat = [
                 window['returns'].mean(),
                 window['returns'].std(),
@@ -257,43 +224,43 @@ class TrainService:
                 np.percentile(window['returns'], 75)
             ]
             features.append(feat)
-
             future_vol = self.df['volatility'].iloc[i:i + 20].mean()
             current_vol = window['volatility'].mean()
-
             if future_vol < current_vol * 0.8:
                 label = 0
             elif future_vol > current_vol * 1.2:
                 label = 2
             else:
                 label = 1
-
             labels.append(label)
 
         X = np.array(features)
         y = np.array(labels)
 
-        self.regime_detector = xgb.XGBClassifier(
-            n_estimators=100,
-            max_depth=5,
-            learning_rate=0.1,
-            random_state=42
-        )
-        self.regime_detector.fit(X, y)
+        self.regime_detector = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42)
 
-        print(f"Regime detector accuracy: {self.regime_detector.score(X, y):.3f}")
+        with mlflow.start_run(run_name="train_regime_detector", nested=True):
+            self.regime_detector.fit(X, y)
+            acc = self.regime_detector.score(X, y)
+            mlflow.log_metric("accuracy", acc)
+            mlflow.xgboost.log_model(self.regime_detector, "regime_detector")
+            logger.info(f"Regime detector accuracy: {acc:.3f}")
+
+            # Save locally for task copy
+            self.regime_detector.save_model(f"{self.registry_path}/regime_detector.json")
+
         return self.regime_detector
 
     def train_meta_model(self, models: dict, X_val, y_val):
         """Train meta-model for confidence"""
-        print("\nTraining meta-model...")
+        logger.info("Training meta-model...")
 
+        # ... (Prepare meta features) ...
         meta_features = []
         meta_labels = []
 
         for i in range(len(X_val)):
-            x = torch.FloatTensor(X_val[i]).unsqueeze(0).to(CONSTANTS.DEVICE)
-
+            x = torch.FloatTensor(X_val[i]).unsqueeze(0).to(self.device)
             predictions = []
             for model in models.values():
                 model.eval()
@@ -302,7 +269,6 @@ class TrainService:
                     probs = torch.softmax(pred['action_logits'], dim=1).cpu().numpy()[0]
                     conf = pred['confidence'].item()
                     predictions.extend([probs[0], probs[1], conf])
-
             meta_features.append(predictions)
             label = 1 if y_val['confidence'][i].item() > 0.5 else 0
             meta_labels.append(label)
@@ -310,26 +276,32 @@ class TrainService:
         meta_X = np.array(meta_features)
         meta_y = np.array(meta_labels)
 
-        unique_classes = np.unique(meta_y)
-        print(f"Meta-label distribution: {np.bincount(meta_y)}")
+        with mlflow.start_run(run_name="train_meta_model", nested=True):
+            if len(np.unique(meta_y)) < 2:
+                self.meta_model = DummyClassifier(strategy='constant', constant=np.unique(meta_y)[0])
+                self.meta_model.fit(meta_X, meta_y)
+            else:
+                self.meta_model = xgb.XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42)
+                self.meta_model.fit(meta_X, meta_y)
+                acc = self.meta_model.score(meta_X, meta_y)
+                mlflow.log_metric("accuracy", acc)
+                mlflow.sklearn.log_model(self.meta_model, "meta_model")
+                logger.info(f"Meta-model accuracy: {acc:.3f}")
 
-        if len(unique_classes) < 2:
-            print("Only one class in meta-labels → using dummy classifier (always predict high confidence)")
-            self.meta_model = DummyClassifier(strategy='constant', constant=unique_classes[0])
-            self.meta_model.fit(meta_X, meta_y)
-        else:
-            self.meta_model = xgb.XGBClassifier(
-                n_estimators=200,
-                max_depth=4,
-                learning_rate=0.1,
-                random_state=42
-            )
-            self.meta_model.fit(meta_X, meta_y)
-            print(f"Meta-model accuracy: {self.meta_model.score(meta_X, meta_y):.3f}")
+            # Save locally for task copy
+            # XGBoost save
+            if hasattr(self.meta_model, "save_model"):
+                self.meta_model.save_model(f"{self.registry_path}/meta_model.json")
+            else:
+                # DummyClassifier or other sklearn
+                with open(f"{self.registry_path}/meta_model.json", "wb") as f:
+                    pickle.dump(self.meta_model, f)
+
         return self.meta_model
 
     def train_rl_agent(self):
-        print("\nTraining RL agent...")
+        logger.info("Training RL agent...")
+
         data_scaled = self.scaler.transform(self.df[CONSTANTS.FEATURE_COLS])
         prices = self.df['Close'].values
         atr = self._calculate_atr(self.df).values
@@ -338,7 +310,20 @@ class TrainService:
             return SignalEnv(data=data_scaled, prices=prices, atr=atr, seq_len=self.seq_len)
 
         self.rl_agent = RLSignalGenerator(env_fn, learning_rate=3e-4)
-        self.rl_agent.train(total_timesteps=100000)
+
+        with mlflow.start_run(run_name="train_rl_agent", nested=True):
+            self.rl_agent.train(total_timesteps=100000)
+
+            # Define paths
+            rl_agent_dir = f"{self.registry_path}/rl_agent"
+            rl_agent_zip = f"{self.registry_path}/rl_agent.zip"
+
+            os.makedirs(rl_agent_dir, exist_ok=True)
+            self.rl_agent.save(rl_agent_dir)
+            mlflow.log_artifacts(rl_agent_dir, artifact_path="rl_agent")
+            shutil.make_archive(rl_agent_dir, 'zip', rl_agent_dir)
+            logger.info(f"RL agent saved to {rl_agent_zip} and logged to MLflow")
+
         return self.rl_agent
 
     def _calculate_atr(self, df, period=14):
@@ -349,44 +334,45 @@ class TrainService:
         tr = pd.concat([tr0, tr1, tr2], axis=1).max(axis=1)
         return tr.ewm(span=period, adjust=False).mean()
 
-    def evaluate_ensemble(self, ensemble, X_test, y_test, df_test):
-        """Evaluate ensemble"""
-        print("\nEvaluating Ensemble...")
-        self.ensemble = ensemble
+    def run_full_training_pipeline(self):
+        """Execute the full training pipeline and save artifacts"""
+        with mlflow.start_run(run_name=f"pipeline_{self.asset}"):
+            # 1. Load Data
+            self.load_and_prepare_data()
 
-        # Calculate ATR for test set
-        atr = self._calculate_atr(df_test)
+            # 2. Create Dataset
+            X, y, self.scaler = self.create_labeled_dataset()
 
-        signals = []
-        for i in range(len(X_test)):
-            try:
-                idx = CONSTANTS.SEQ_LEN + i
-                if idx >= len(df_test):
-                    break
+            # Save scaler
+            scaler_path = os.path.join(self.registry_path, "scaler.pkl")
+            with open(scaler_path, "wb") as f:
+                pickle.dump(self.scaler, f)
+            mlflow.log_artifact(scaler_path)
+            # Keep scaler.pkl for task copy
 
-                signal = self.ensemble.generate_signal(
-                    observation=X_test[i],
-                    current_price=df_test['Close'].iloc[idx],
-                    current_atr=atr.iloc[idx],
-                    market_data=df_test.iloc[:idx],
-                    signal_id=f"TEST_{i}"
-                )
-                signals.append(signal)
-            except Exception as e:
-                print(f"Error generating signal {i}: {e}")
-                continue
+            # 3. Split
+            X_train, X_val, X_test, y_train, y_val, y_test = self.train_test_split_dict(X, y)
 
-        print(f"\nGenerated {len(signals)} signals")
+            # 4. Train Models
+            input_dim = X_train.shape[2]
 
-        # Analyze
-        actions = [1 if s.action == "Long" else 0 for s in signals]
-        print(f"Actions: Long={sum(actions)}, Short={len(actions) - sum(actions)}")
-        print(f"Avg Confidence: {np.mean([s.confidence for s in signals]):.3f}")
-        print(f"Avg Agreement: {np.mean([s.models_agreement for s in signals]):.3f}")
-        print(f"Avg Leverage: {np.mean([s.leverage for s in signals]):.1f}")
-        print(f"Avg Risk/Reward: {np.mean([s.risk_reward_ratio for s in signals]):.2f}")
+            model1 = SignalGenerator(input_dim=input_dim, seq_len=self.seq_len)
+            self.model1, _ = self.train_model(model1, X_train, y_train, X_val, y_val, "EnhancedModel1")
 
-        return signals
+            model2 = SignalGenerator(input_dim=input_dim, seq_len=self.seq_len, d_model=512)
+            self.model2, _ = self.train_model(model2, X_train, y_train, X_val, y_val, "EnhancedModel2")
+
+            # 5. Train RL
+            self.rl_agent = self.train_rl_agent()
+
+            # 6. Train Helpers
+            self.regime_detector = self.train_regime_detector()
+            self.meta_model = self.train_meta_model(
+                {'model1': self.model1, 'model2': self.model2}, X_val, y_val
+            )
+
+            logger.info("Training pipeline completed successfully.")
+            return True
 
     @staticmethod
     def train_test_split_dict(X, y_dict, val_ratio=0.15, test_ratio=0.15):
@@ -400,5 +386,5 @@ class TrainService:
         y_val = {k: split(v)[1] for k, v in y_dict.items()}
         y_test = {k: split(v)[2] for k, v in y_dict.items()}
 
-        print(f"Train/Val/Test split: {len(X_train)} / {len(X_val)} / {len(X_test)}")
+        logger.info(f"Train/Val/Test split: {len(X_train)} / {len(X_val)} / {len(X_test)}")
         return X_train, X_val, X_test, y_train, y_val, y_test
